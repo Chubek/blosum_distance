@@ -146,3 +146,5 @@ pyvenv.cfg
 
 # old python files
 outlier/
+
+tst_py.py
