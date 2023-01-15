@@ -330,6 +330,9 @@ impl FastLineReader {
                     })
                     .flatten()
                     .collect::<Vec<String>>();    
+                
+                let mut first = ret_strings.get_mut(0).unwrap();
+                first = format!("{}{}", self.remainder, first).borrow_mut();
 
                 self.remainder = ret_strings.pop().unwrap();
 
@@ -505,6 +508,7 @@ fn blosum62_distance(one: String, two: String) -> PyResult<f64> {
 
 // A Python module implemented in Rust.
 #[pymodule]
+#[pyo3(name = "phymmr_tools_chubak")]
 fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(blosum62_distance, m)?)?;
     m.add_function(wrap_pyfunction!(batch_reverse_complement, m)?)?;
