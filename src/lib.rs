@@ -5,21 +5,37 @@ extern crate hashbrown;
 extern crate pyo3;
 
 use core::num;
-use std::borrow::BorrowMut;
+use std::borrow::{BorrowMut, Borrow};
 // use statrs::statistics::OrderStatistics;
 // use statrs::statistics::Data;
 use std::fs::File;
 use std::io::{prelude::*, BufReader};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::usize;
 // use std::sync::Arc;
 //use bio::alphabets::dna::complement;
 use bio::io::fasta;
 use bio::scores::blosum62;
 use itertools::Itertools;
+use lazy_static::__Deref;
 use proc_utils::{add_x_members, repeat_across_x_times, repeat_across_x_times_and_create_struct};
+use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
+use pyo3::pyclass::{PyIterNextOutput, IterNextOutput};
+use pyo3::types::PyIterator;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io::IoSliceMut;
-use std::ptr::addr_of_mut;
+use std::ptr::{addr_of_mut, addr_of};
+use std::alloc::{alloc, dealloc, Layout};
+use parking_lot::Mutex;
+use lazy_static::lazy_static;
+use regex::Regex;
+
+lazy_static! {
+    static ref NEWLINE: Regex = Regex::new("\n").unwrap();
+}
 
 // use rayon::prelude::*;
 
@@ -229,157 +245,132 @@ fn seqs_within_distance(first: &str, second: &str, max_distance: u32) -> bool {
     true
 }
 
-#[add_x_members(buff_*: Vec<u8>, => 256)]
-struct Buffers {}
+#[derive(Clone)]
+struct Buffers {
+    buffers: Vec<Vec<u8>>,
+    num_buffers: usize
+}
 
 impl Buffers {
-    pub fn new() -> Self {
-        repeat_across_x_times! {
-            let buff_* = vec![0u8; 8192]; @ 256
-        };
+    pub fn new(num_buffers: usize, buffsize: usize) -> Self {
+        let buffers = vec![vec![0u8; buffsize]; num_buffers];
 
-        repeat_across_x_times_and_create_struct!(
-            Self { * } @ buff_*, @ 256
-        )
+        Self { buffers, num_buffers }
     }
 }
+
 
 struct FastLineReader {
     bufreader: BufReader<File>,
     iovecs: Vec<IoSliceMut<'static>>,
     str_buffers: Vec<String>,
     remainder: String,
-    remaining_vec: Vec<usize>,
+    num_reads: usize,
+    buffers: Buffers,
+    num_buffers: usize,
 }
 
 impl FastLineReader {
-    pub fn new(path: String, buffers_ptr: *mut Buffers) -> Self {
+    pub fn new(path: String, num_buffers:usize,  buffsize: usize) -> Self {
         println!("Starting new FastLineReader instance on path {path}");
 
-        let buffers: &mut Buffers = unsafe { &mut *buffers_ptr };
-
+        let buffers = Buffers::new(num_buffers, buffsize);
         let bufreader = BufReader::new(File::open(path).expect("Error opening output file"));
+        let mut iovecs: Vec<IoSliceMut<'static>> = Vec::new();       
 
-        let mut iovecs: Vec<IoSliceMut<'static>> = Vec::new();
-
-        repeat_across_x_times! {
-            iovecs.push(IoSliceMut::new(&mut buffers.buff_*)); @ 256
-        };
-
-        let str_buffers = vec![str_make!(""); 256];
+        let str_buffers = vec![str_make!(""); num_buffers];
 
         Self {
             bufreader,
             iovecs,
             str_buffers,
-            remaining_vec: vec![],
+            num_reads: 0,
             remainder: str_make!(""),
+            buffers,
+            num_buffers,
         }
     }
 
-    pub fn fill_and_get_lines(&mut self, index: usize) {
-        let curr_buffer = self
-            .str_buffers
-            .get_mut(index)
-            .expect("Error getting buffer");
-        let curr_vio = self.iovecs.get(index).expect("Error getting vecio");
+    pub fn init(&mut self) {
+        let ptr = addr_of_mut!(self.buffers);
 
-        curr_vio.iter().cloned().for_each(|c| {
-            curr_buffer.push(c as char);
-        });
+        for i in 0..self.num_buffers {
+            let buffers_ref = unsafe { ptr.as_mut().unwrap() };
+
+            self.iovecs.push(IoSliceMut::new(&mut buffers_ref.buffers[i]));
+        }
     }
 
-    pub fn read_batch(&mut self) -> Vec<String> {
-        let rem = self
+    pub fn fill_and_get_lines(&self, index: usize) -> (usize, String) {
+        let curr_vio = self.iovecs.get(index).expect("Error getting vecio");
+
+        let mut curr_buffer = String::from_utf8(Vec::from_iter(curr_vio.iter().cloned()))
+            .expect("Error converting to UTF-8 string");
+
+        (index, curr_buffer)
+    }
+
+    pub fn read_batch(&mut self) -> Option<Vec<String>> {
+        let read_size = self
             .bufreader
             .read_vectored(&mut self.iovecs)
             .expect("Error with Vector Read");
+        self.num_reads += 1;
 
-        self.remaining_vec.push(rem);
+        match read_size > 0 {
+            true => {
+                let mut ret_strings = self.iovecs
+                    .par_iter()
+                    .map(|iov| {                        
+                        let str = String::from_iter(
+                            iov.par_iter().map(|c| *c as char).collect::<Vec<char>>()
+                        );
 
-        if rem == 0 {
-            if self.remainder.len() != 0 {
-                return vec![self.remainder.clone()];
+                        str.lines().map(String::from).collect_vec()                    
+                    })
+                    .flatten()
+                    .collect::<Vec<String>>();    
+
+                self.remainder = ret_strings.pop().unwrap();
+
+                Some(ret_strings)
             }
-
-            return vec![];
+            false => match self.remainder.len() > 0 {
+                true => {
+                    let ret = vec![self.remainder.clone()];
+                    self.remainder.clear();
+                    Some(ret)
+                },
+                false => None,
+            },
         }
-
-        let ret_list = (0..256)
-            .into_iter()
-            .for_each(|i| self.fill_and_get_lines(i));
-
-        let strings_together = self.str_buffers.join("");
-        let with_rem = format!("{}{}{}", self.remainder, strings_together, "\n");
-
-        let mut split: Vec<String> = vec![];
-        let mut buff = str_make!("");
-
-        with_rem.chars().for_each(|c| {
-            if c == '\n' {
-                let trimmed = buff.trim();
-                split.push(trimmed.to_string());
-                buff.clear();
-            } else {
-                if c != '\0' {
-                    buff.push(c);
-                }
-            }
-        });
-
-        if *self.remaining_vec.first().unwrap() == 8192 * 256
-            && self.remaining_vec.len() > 1
-            && *self.remaining_vec.last().unwrap() == 8192 * 256
-        {
-            self.remainder = split.pop().unwrap();
-        }
-
-        split
     }
 }
 
+
+
 #[pyclass]
 struct VecIO {
-    freader: Option<FastLineReader>,
-    buffers: Buffers,
+    freader: FastLineReader,
 }
 
 #[pymethods]
 impl VecIO {
     #[new]
-    pub fn new() -> Self {
+    pub fn new(path: String, num_buffers: usize, buffsize: usize) -> Self {
+        let mut fio = FastLineReader::new(path, num_buffers, buffsize);
+        fio.init();
+
         Self {
-            buffers: Buffers::new(),
-            freader: None,
+            freader: fio
         }
     }
 
-    pub fn init(&mut self, path: String) {
-        let buffers_ptr: *mut Buffers = addr_of_mut!(self.buffers);
-
-        self.freader = Some(FastLineReader::new(path, buffers_ptr));
-    }
-
-    pub fn is_done(&mut self) -> bool {
-        let derefed = self.freader.as_mut().unwrap();
-
-        *derefed.remaining_vec.last().unwrap() == 0
-    }
-
-    pub fn get_next_batch(&mut self) -> Vec<String> {
-        let derefed = self.freader.as_mut().unwrap();
-
-        derefed.read_batch()
-    }
+    pub fn get_next_batch(&mut self) -> Option<Vec<String>> {
+        self.freader.read_batch()       
+    }   
 }
 
-#[pyfunction]
-fn get_vecio(path: String) -> VecIO {
-    let mut vio = VecIO::new();
-    vio.init(path);
-
-    vio
-}
 
 fn not_skip_character(character: u8) -> bool {
     const HYPHEN: u8 = 45;
@@ -526,7 +517,7 @@ fn phymmr_tools(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(make_ref_distance_matrix_supervector, m)?)?;
     m.add_function(wrap_pyfunction!(make_ref_distance_vector_blosum62, m)?)?;
     m.add_function(wrap_pyfunction!(ref_index_vector, m)?)?;
-    m.add_function(wrap_pyfunction!(get_vecio, m)?)?;
+    m.add_class::<VecIO>();
 
     Ok(())
 }
